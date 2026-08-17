@@ -152,8 +152,14 @@ struct moe_cache_global {
     size_t min_expert_bytes = 1u << 20; // skip models whose experts are too small
                                         // to amortize per-node dispatch (measured:
                                         // 0.45MB experts lose, 3MB+ win big)
-    int    max_batch        = 1; // decode batches up to this size use the cache
-                                 // (GGML_CUDA_MOE_CACHE_MAX_BATCH; >1 for spec-verify/parallel)
+    int    max_batch        = 8; // decode batches up to this size use the cache
+                                 // (GGML_CUDA_MOE_CACHE_MAX_BATCH). Must exceed 1: a
+                                 // speculative-decode verify pass carries n_draft+1
+                                 // tokens and multi-slot decode carries n_seq, and a
+                                 // limit of 1 classified those as prompt processing —
+                                 // the cache then never engaged at all (measured: dspark
+                                 // n_max=3 dropped 10.3 -> 6.6 t/s, zero hits). Prompt
+                                 // chunks are n_ubatch (>= 32) and stay above this.
     int    stats_every      = 0; // log every N collect() calls (0 = off)
 
     moe_cache_device dev[MOE_CACHE_MAX_DEV];
@@ -1750,8 +1756,14 @@ void ggml_moe_cache_register(void) {
     if (const char * e = getenv("GGML_CUDA_MOE_CACHE_MIN_EXPERT_KB")) g.min_expert_bytes = (size_t)atoll(e) << 10;
     if (const char * e = getenv("GGML_CUDA_MOE_CACHE_RESERVE_MB"))    g.reserve_mb = (size_t)atoll(e);
     if (const char * e = getenv("GGML_CUDA_MOE_CACHE_REUSE"))         g.reuse = atoi(e) > 0;
-    if (const char * e = getenv("GGML_CUDA_MOE_CACHE_FUSE"))          g.fuse = atoi(e) > 0;
+    const char * e_fuse = getenv("GGML_CUDA_MOE_CACHE_FUSE");
     if (const char * e = getenv("GGML_CUDA_MOE_CACHE_MAX_BATCH"))     { int n = atoi(e); if (n >= 1 && n <= 8) g.max_batch = n; }
+    // the fused gate+up+GLU path only fires at n_tokens == 1, but pairing halves a
+    // pool slot count. Under multi-token decode that trade is all cost and no benefit
+    // (measured: 1117 -> 2235 slots, 51% -> 63% hits, 8.7 -> 10.4 t/s with dspark).
+    // explicit GGML_CUDA_MOE_CACHE_FUSE always wins.
+    if (g.max_batch > 1) g.fuse = false;
+    if (e_fuse) g.fuse = atoi(e_fuse) > 0;
     if (const char * e = getenv("GGML_CUDA_MOE_CACHE_PREFETCH"))      g.backfill.enabled = atoi(e) > 0;
     if (const char * e = getenv("GGML_CUDA_MOE_CACHE_HOTSET"))        g.hotset_enabled = atoi(e) > 0;
     g.hotset_last_save = ggml_time_us();   // first save no sooner than one period in
