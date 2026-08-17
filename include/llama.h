@@ -328,6 +328,7 @@ extern "C" {
         bool use_extra_bufts; // use extra buffer types (used for weight repacking)
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
+        bool load_mtp;        // whether to load MTP layers
         bool profile_tensors; // [EXPERIMENTAL] profile per-tensor CPU/GPU performance
         bool auto_placement;  // [EXPERIMENTAL] automatically apply optimal tensor placement
         bool dynamic_transfer;// [EXPERIMENTAL] runtime dynamic CPU↔GPU tensor promotion
