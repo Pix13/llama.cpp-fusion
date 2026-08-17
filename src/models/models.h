@@ -1090,10 +1090,9 @@ struct llama_model_deepseek4 : public llama_model_base {
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
 
-    // helpers shared by the trunk graph and the NextN/MTP draft graph
-    // (no graph building in the ctor — only the derived structs build)
-    struct graph_common : public llm_graph_context {
-        graph_common(const llm_graph_params & params) : llm_graph_context(params) {}
+    struct graph : public llm_graph_context {
+        graph(const llm_graph_params & params) : llm_graph_context(params) {}
+        graph(const llama_model & model, const llm_graph_params & params);
 
         ggml_tensor * build_hc_pre(
                 ggml_tensor * x,
@@ -1120,6 +1119,21 @@ struct llama_model_deepseek4 : public llama_model_base {
         ggml_tensor * build_attention(
                 const llama_model & model,
                 llm_graph_input_dsv4 * inp_dsv4,
+                ggml_tensor * cur,
+                ggml_tensor * inp_pos,
+                int il) const;
+
+        ggml_tensor * build_attention(
+                const llama_model & model,
+                llm_graph_input_attn_k_iswa * inp_mtp,
+                ggml_tensor * cur,
+                ggml_tensor * inp_pos,
+                int il) const;
+
+        ggml_tensor * build_attention_impl(
+                const llama_model & model,
+                llm_graph_input_dsv4 * inp_dsv4,
+                llm_graph_input_attn_k_iswa * inp_mtp,
                 ggml_tensor * cur,
                 ggml_tensor * inp_pos,
                 int il) const;
@@ -1199,14 +1213,7 @@ struct llama_model_deepseek4 : public llama_model_base {
                 int il) const;
     };
 
-    // trunk graph (main model, all decoder types except DECODER_MTP)
-    struct graph : public graph_common {
-        graph(const llama_model & model, const llm_graph_params & params);
-    };
-
-    // NextN/MTP draft graph (LLM_GRAPH_TYPE_DECODER_MTP): one full DSV4 block
-    // at il = n_layer() fed by add(e_proj*enorm(tok), h_proj*hnorm(h))
-    struct graph_mtp : public graph_common {
+    struct graph_mtp : public graph {
         graph_mtp(const llama_model & model, const llm_graph_params & params);
     };
 
@@ -1261,6 +1268,10 @@ struct llama_model_dflash : public llama_model_base {
         graph(const llama_model & model, const llm_graph_params & params);
 
         ggml_tensor * build_inp_embd_enc() const;
+    };
+
+    struct graph_dsv4 : public llama_model_deepseek4::graph {
+        graph_dsv4(const llama_model & model, const llm_graph_params & params);
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;

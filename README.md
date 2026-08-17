@@ -118,11 +118,11 @@ GGML_CUDA_MOE_CACHE=1 GGML_CUDA_MOE_CACHE_BUDGET_MB=11000
 | `GGML_CUDA_MOE_CACHE_STATS` | 0 | Print stats every N tokens |
 
 ### 🤖 MTP Stack (Multi-Token Prediction / Speculative Decoding)
-Native support for DeepSeek V4 Flash's built-in MTP (Multi-Token Prediction) draft model. The merged GGUF contains both the trunk model (43 layers) and the MTP head (1 nextn block) — no separate draft model file needed.
+Support for DeepSeek V4 Flash's built-in MTP (Multi-Token Prediction) draft head, following the upstream implementation (llama.cpp PR #25784). The merged GGUF contains both the trunk model (43 layers) and the MTP head (1 nextn block) - no separate draft model file needed.
 
 ```
-# Enable speculative decoding with built-in draft model
---speculative-model model.gguf --speculative-n-draft 3
+# Enable speculative decoding with the built-in MTP head
+--spec-type draft-mtp --spec-draft-n-max 2
 ```
 
 **How it works (DSV4 Flash architecture):**
@@ -132,10 +132,13 @@ Native support for DeepSeek V4 Flash's built-in MTP (Multi-Token Prediction) dra
 - Accepted tokens are emitted; rejected tokens trigger a draft re-roll
 
 **Architecture details:**
-- Single MTP block (same architecture as a plain trunk block — no compression, no hash routing)
-- Input: `e_proj * enorm(token)` + `h_proj * hnorm(hidden)` — hybrid embedding + hidden state
+- Single MTP block (same architecture as a plain trunk block - no compression, no hash routing)
+- Input: `eh_proj` over concat(`enorm(token embedding)`, `hnorm(hidden state)`)
 - Tied input/output: shares `tok_embd` and `output` (lm_head) with the trunk
-- Shares the same HC (Heavy Compensation) head functions
+- Runs as an iSWA KV cache context filtered to the nextn layer(s)
+
+**DSpark:** a separate DSpark draft head (`--spec-type draft-dspark`) is also supported for DSV4;
+see [docs/speculative.md](docs/speculative.md).
 
 **Note:** MTP is optional. The trunk model runs fine without it. Enable when you need maximum single-request throughput and have VRAM to spare (the draft model adds ~2-3 GB VRAM overhead).
 
