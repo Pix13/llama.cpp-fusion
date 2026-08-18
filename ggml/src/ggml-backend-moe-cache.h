@@ -49,8 +49,12 @@ struct ggml_moe_cache_api {
     // (in dispatch order) into dst_rows[0..n_hits-1] (n_out floats each).
     void (*collect)(int dev, int n_hits, float * const * dst_rows, int64_t n_out);
 
-    // Periodic stats logging (rate-limited internally).
+    // Periodic stats logging (rate-limited internally, GGML_CUDA_MOE_CACHE_STATS).
     void (*stats)(void);
+
+    // One-shot compact summary at INFO level, for printing next to a request's
+    // token timings. Unlike stats() this is not rate-limited and not verbose.
+    void (*stats_summary)(void);
 
     // ---- GPU-resident dst handoff (down-projection round-trip elimination) ----
     // The scheduler offers the GPU-side copy tensor of a CPU MUL_MAT_ID dst

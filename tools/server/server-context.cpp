@@ -10,6 +10,7 @@
 #include "build-info.h"
 #include "common.h"
 #include "fit.h"
+#include "ggml-backend.h"
 #include "llama.h"
 #include "log.h"
 #include "sampling.h"
@@ -627,6 +628,8 @@ struct server_slot {
         }
 
         common_speculative_print_stats(spec);
+
+        ggml_backend_moe_cache_print_stats();
     }
 
     json to_json(bool only_metrics = false) const {

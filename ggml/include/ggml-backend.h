@@ -351,6 +351,10 @@ extern "C" {
     // Set a callback to be called for each resulting node during graph compute
     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
 
+    // MoE expert cache (see ggml-backend-moe-cache.h): print a one-line-per-device
+    // summary at INFO level. No-op when no backend registered an implementation.
+    GGML_API void                 ggml_backend_moe_cache_print_stats(void);
+
     //
     // Meta backend
     //
