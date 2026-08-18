@@ -52,9 +52,11 @@ struct ggml_moe_cache_api {
     // Periodic stats logging (rate-limited internally, GGML_CUDA_MOE_CACHE_STATS).
     void (*stats)(void);
 
-    // One-shot compact summary at INFO level, for printing next to a request's
-    // token timings. Unlike stats() this is not rate-limited and not verbose.
-    void (*stats_summary)(void);
+    // One-shot compact summary written into buf as newline-separated lines.
+    // Returns bytes written (0 if the cache never engaged). The caller prints
+    // it with its own logger: ggml's INFO level maps to trace verbosity in
+    // common/log.cpp, so logging it here would never reach the user.
+    int (*stats_summary)(char * buf, size_t buf_size);
 
     // ---- GPU-resident dst handoff (down-projection round-trip elimination) ----
     // The scheduler offers the GPU-side copy tensor of a CPU MUL_MAT_ID dst

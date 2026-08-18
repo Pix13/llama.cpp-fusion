@@ -629,7 +629,14 @@ struct server_slot {
 
         common_speculative_print_stats(spec);
 
-        ggml_backend_moe_cache_print_stats();
+        {
+            char moe_buf[1024] = {};
+            if (ggml_backend_moe_cache_get_stats(moe_buf, sizeof(moe_buf)) > 0) {
+                for (char * line = strtok(moe_buf, "\n"); line; line = strtok(nullptr, "\n")) {
+                    SLT_INF(*this, "%s\n", line);
+                }
+            }
+        }
     }
 
     json to_json(bool only_metrics = false) const {

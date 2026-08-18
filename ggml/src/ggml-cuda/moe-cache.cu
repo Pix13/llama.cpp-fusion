@@ -1586,10 +1586,12 @@ static void moe_cache_node_time(int code, int64_t us) {
 
 // ---- API: stats ----------------------------------------------------------------------
 
-// One compact line per device at INFO, meant to be printed once when a request
-// finishes (alongside the token timings) rather than every N collect() calls.
+// One compact line per device, written into the caller's buffer. The server
+// prints it next to the token timings; ggml's own INFO level maps to trace
+// verbosity in common/log.cpp, so logging from here would never be seen.
 // Counters are cumulative for the process, like llama's perf counters.
-static void moe_cache_stats_summary(void) {
+static int moe_cache_stats_summary(char * buf, size_t buf_size) {
+    size_t off = 0;
     for (int i = 0; i < g.n_dev; i++) {
         moe_cache_device & d = g.dev[i];
         if (!d.compute_stream) continue;
@@ -1604,9 +1606,14 @@ static void moe_cache_stats_summary(void) {
         }
         const double per_node = d.n_nodes > 0
             ? (double)(d.t_plan_us + d.t_disp_us + d.t_coll_us) / d.n_nodes : 0.0;
-        GGML_LOG_INFO("moe-cache: dev=%d hits = %lld/%lld (%.1f%%), slots = %d/%d (%zu MiB), %.1f us/node\n",
+        if (off >= buf_size) break;
+        const int n = snprintf(buf + off, buf_size - off,
+                "moe-cache: dev=%d hits = %lld/%lld (%.1f%%), slots = %d/%d (%zu MiB), %.1f us/node\n",
                 i, d.hits, tot, 100.0 * d.hits / tot, used, slots, bytes >> 20, per_node);
+        if (n < 0 || (size_t)n >= buf_size - off) { buf[off] = 0; break; }
+        off += n;
     }
+    return (int)off;
 }
 
 
