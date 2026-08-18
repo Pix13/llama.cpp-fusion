@@ -2587,8 +2587,9 @@ ggml_backend_buffer_t ggml_backend_cpu_buffer_from_ptr(void * ptr, size_t size) 
     return ggml_backend_buffer_init(ggml_backend_cpu_buffer_from_ptr_type(), ggml_backend_cpu_buffer_from_ptr_i, ptr, size);
 }
 
-void ggml_backend_moe_cache_print_stats(void) {
-    if (ggml_moe_cache.stats_summary) {
-        ggml_moe_cache.stats_summary();
+int ggml_backend_moe_cache_get_stats(char * buf, size_t buf_size) {
+    if (!ggml_moe_cache.stats_summary || !buf || buf_size == 0) {
+        return 0;
     }
+    return ggml_moe_cache.stats_summary(buf, buf_size);
 }
