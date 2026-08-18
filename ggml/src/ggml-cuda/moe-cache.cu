@@ -268,6 +268,14 @@ struct moe_cache_global {
         long long base_n = 0, on_n = 0;
         int       strikes = 0;
         bool      tripped = false;
+        // token count of the node currently being timed. The baseline is
+        // sampled in one early window while the engaged EWMA accumulates over
+        // the whole run, so the two are only comparable at a fixed batch size:
+        // a 2-token decode node moves ~2x the expert rows and is legitimately
+        // slower than a 1-token baseline. Sampling both only at n_tokens == 1
+        // keeps the judge comparing like with like (without this, -np 2 tripped
+        // the bail-out and disabled the cache mid-run).
+        int       cur_batch = 1;
     } bail;
     static constexpr long long BAIL_WARM   = 500;   // ignored (first-touch effects)
     static constexpr long long BAIL_SAMPLE = 2750;  // baseline window end
@@ -881,6 +889,7 @@ static int moe_cache_begin(const char * name, const void * host_base, size_t exp
     }
 
     // bail-out phases (decode visits on a working pool only)
+    g.bail.cur_batch = (int) n_tokens;   // set before the early returns below
     if (!g.bail.tripped) {
         const long long vis = g.bail.eligible_seen++;
         if (vis < moe_cache_global::BAIL_WARM) return -1;        // warmup: no sample
@@ -1558,6 +1567,8 @@ static void moe_cache_invalidate(const void * base, size_t size) {
 static void moe_cache_node_time(int code, int64_t us) {
     if (g.bail.tripped) return;
     auto & b = g.bail;
+    // only single-token decode nodes are comparable against the baseline
+    if (b.cur_batch != 1) return;
     if (code == -3) {
         b.base_ewma = b.base_n == 0 ? (double)us : b.base_ewma + ((double)us - b.base_ewma) / 256.0;
         b.base_n++;
