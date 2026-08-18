@@ -45,7 +45,10 @@
 // key-space tag for paired (gate, up) entries: keeps them disjoint from the
 // name-hash-keyed entries of unpaired pools that share the same shape
 #define MOE_CACHE_PAIR_KEY_TAG 0xEC3000000000000ULL
-#define MOE_CACHE_LOG(...)   fprintf(stderr, __VA_ARGS__)
+// verbose tracing: hidden unless the host raises log verbosity (llama.cpp maps
+// GGML_LOG_LEVEL_DEBUG to -lv). The end-of-request summary is the default view.
+#define MOE_CACHE_LOG(...)   GGML_LOG_DEBUG(__VA_ARGS__)
+#define MOE_CACHE_WARN(...)  GGML_LOG_WARN(__VA_ARGS__)
 
 struct moe_cache_slot {
     uint64_t key;
@@ -291,7 +294,7 @@ static bool moe_cache_ok(int di, cudaError_t e, const char * what) {
     cudaGetLastError();
     if (di >= 0 && di < MOE_CACHE_MAX_DEV && !g.dev[di].dead) {
         g.dev[di].dead = true;
-        MOE_CACHE_LOG("[moe-cache] dev=%d DISABLED: %s failed: %s (CPU path takes over)\n",
+        MOE_CACHE_WARN("[moe-cache] dev=%d DISABLED: %s failed: %s (CPU path takes over)\n",
                 di, what, cudaGetErrorString(e));
     }
     return false;
@@ -519,7 +522,7 @@ static void moe_cache_worker_main(int wid) {
                 cudaGetLastError();
                 static int warned = 0;
                 if (warned++ < 3) {
-                    MOE_CACHE_LOG("[moe-cache] insert copy failed: %s\n", cudaGetErrorString(err));
+                    MOE_CACHE_WARN("[moe-cache] insert copy failed: %s\n", cudaGetErrorString(err));
                 }
             }
         }
@@ -574,7 +577,7 @@ static bool moe_cache_pool_alloc(int di, size_t expert_size, int wtype, size_t b
     if (ns < 64) {
         static int warned = 0;
         if (warned++ < 2) {
-            MOE_CACHE_LOG("[moe-cache] dev=%d pool for %zu KB slots skipped (budget %zu MB too small) — cache stays off for this shape\n",
+            MOE_CACHE_WARN("[moe-cache] dev=%d pool for %zu KB slots skipped (budget %zu MB too small) — cache stays off for this shape\n",
                     di, expert_size >> 10, budget >> 20);
         }
         // dead marker: prevents endless re-discovery + re-trigger + log spam
@@ -591,7 +594,7 @@ static bool moe_cache_pool_alloc(int di, size_t expert_size, int wtype, size_t b
     cudaError_t err = cudaMalloc((void **)&slab, (size_t)ns * expert_size);
     if (err != cudaSuccess) {
         cudaGetLastError();
-        MOE_CACHE_LOG("[moe-cache] dev=%d pool alloc failed: %s\n", di, cudaGetErrorString(err));
+        MOE_CACHE_WARN("[moe-cache] dev=%d pool alloc failed: %s\n", di, cudaGetErrorString(err));
         return false;
     }
     char * slab2 = nullptr;
@@ -600,7 +603,7 @@ static bool moe_cache_pool_alloc(int di, size_t expert_size, int wtype, size_t b
         if (err != cudaSuccess) {
             cudaGetLastError();
             cudaFree(slab);
-            MOE_CACHE_LOG("[moe-cache] dev=%d paired pool alloc failed: %s\n", di, cudaGetErrorString(err));
+            MOE_CACHE_WARN("[moe-cache] dev=%d paired pool alloc failed: %s\n", di, cudaGetErrorString(err));
             return false;
         }
     }
@@ -1506,7 +1509,7 @@ extern "C" size_t ggml_moe_cache_trim(int device) {
     memset(g.resident_pair, 0, sizeof(g.resident_pair));
     memset(g.resident_down, 0, sizeof(g.resident_down));
     d.dead = true;
-    MOE_CACHE_LOG("[moe-cache] dev=%d TRIMMED %zu MB under VRAM pressure — cache off on this device\n",
+    MOE_CACHE_WARN("[moe-cache] dev=%d TRIMMED %zu MB under VRAM pressure — cache off on this device\n",
             device, freed >> 20);
     return freed;
 }
@@ -1568,7 +1571,7 @@ static void moe_cache_node_time(int code, int64_t us) {
     if (b.on_ewma > b.base_ewma * 1.05) {
         if (++b.strikes >= 4) {
             b.tripped = true;
-            MOE_CACHE_LOG("[moe-cache] bail-out: cache-engaged nodes average %.0fus vs %.0fus pure-CPU — "
+            MOE_CACHE_WARN("[moe-cache] bail-out: cache-engaged nodes average %.0fus vs %.0fus pure-CPU — "
                     "disabling the cache and freeing its VRAM for this run\n",
                     b.on_ewma, b.base_ewma);
             for (int di = 0; di < g.n_dev; di++) {
@@ -1582,6 +1585,30 @@ static void moe_cache_node_time(int code, int64_t us) {
 }
 
 // ---- API: stats ----------------------------------------------------------------------
+
+// One compact line per device at INFO, meant to be printed once when a request
+// finishes (alongside the token timings) rather than every N collect() calls.
+// Counters are cumulative for the process, like llama's perf counters.
+static void moe_cache_stats_summary(void) {
+    for (int i = 0; i < g.n_dev; i++) {
+        moe_cache_device & d = g.dev[i];
+        if (!d.compute_stream) continue;
+        const long long tot = d.hits + d.misses;
+        if (tot == 0) continue;
+        int used = 0, slots = 0;
+        size_t bytes = 0;
+        for (int pi = 0; pi < d.n_pools; pi++) {
+            used  += d.pools[pi].n_used;
+            slots += d.pools[pi].n_slots;
+            bytes += (size_t)d.pools[pi].n_slots * d.pools[pi].expert_size * (d.pools[pi].paired ? 2 : 1);
+        }
+        const double per_node = d.n_nodes > 0
+            ? (double)(d.t_plan_us + d.t_disp_us + d.t_coll_us) / d.n_nodes : 0.0;
+        GGML_LOG_INFO("moe-cache: dev=%d hits = %lld/%lld (%.1f%%), slots = %d/%d (%zu MiB), %.1f us/node\n",
+                i, d.hits, tot, 100.0 * d.hits / tot, used, slots, bytes >> 20, per_node);
+    }
+}
+
 
 static void moe_cache_stats(void) {
     for (int i = 0; i < g.n_dev; i++) {
@@ -1775,6 +1802,7 @@ void ggml_moe_cache_register(void) {
     ggml_moe_cache.dispatch = moe_cache_dispatch;
     ggml_moe_cache.collect  = moe_cache_collect;
     ggml_moe_cache.stats    = moe_cache_stats;
+    ggml_moe_cache.stats_summary = moe_cache_stats_summary;
     ggml_moe_cache.redirect_offer    = moe_cache_redirect_offer;
     ggml_moe_cache.redirect_finalize = moe_cache_redirect_finalize;
     ggml_moe_cache.glu_hits          = moe_cache_glu_hits;
