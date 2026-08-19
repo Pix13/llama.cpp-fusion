@@ -76,7 +76,19 @@ struct moe_cache_pool {
 struct moe_cache_device {
     moe_cache_pool pools[MOE_CACHE_MAX_POOLS];
     int      n_pools = 0;
-    bool     dead    = false;   // CUDA failure or trim: cache permanently off here
+    bool     dead    = false;   // CUDA failure or trim: cache off here
+    // Re-arm after a VRAM-pressure trim. The trim is a last-resort OOM handler
+    // (ggml-cuda.cu: alloc fails -> flush pool -> retry -> surrender the cache),
+    // so the pressure is usually transient while the death was permanent, which
+    // cost ~50% of decode throughput for the rest of the process. Each trim
+    // raises this device's reserve by MOE_CACHE_REARM_STEP_MB and lets the
+    // normal discovery path rebuild; after MOE_CACHE_REARM_MAX trims we give up.
+    // Only the pressure path sets rearmable -- a CUDA error (moe_cache_ok) means
+    // something is broken, not merely tight, and must stay dead.
+    bool      rearmable    = false;
+    int       rearm_count  = 0;     // trims so far; also the reserve penalty step
+    int64_t   trim_time_us = 0;     // for the cooldown
+    long long dead_visits  = 0;     // eligible visits seen while dead (cheap gate)
 
     cudaStream_t compute_stream = nullptr;
 
@@ -164,6 +176,11 @@ struct moe_cache_global {
                                  // n_max=3 dropped 10.3 -> 6.6 t/s, zero hits). Prompt
                                  // chunks are n_ubatch (>= 32) and stay above this.
     int    stats_every      = 0; // log every N collect() calls (0 = off)
+    long long force_trim    = 0; // GGML_CUDA_MOE_CACHE_FORCE_TRIM=<n>: trim the
+                                 // device after n eligible visits, to exercise
+                                 // the re-arm path (VRAM pressure is not
+                                 // reproducible on demand). 0 = off.
+    long long force_trim_seen = 0;
 
     moe_cache_device dev[MOE_CACHE_MAX_DEV];
 
@@ -277,6 +294,10 @@ struct moe_cache_global {
         // the bail-out and disabled the cache mid-run).
         int       cur_batch = 1;
     } bail;
+    static constexpr int  REARM_MAX        = 6;    // trims before giving up for the run
+    static constexpr int  REARM_STEP_MB    = 256;  // reserve added per trim (6 x 256 = 1.5 GB)
+    static constexpr int64_t REARM_COOLDOWN_US = 60ll * 1000 * 1000;  // settle before retrying
+    static constexpr long long REARM_GATE_VISITS = 2048;  // cheap gate off the hot path
     static constexpr long long BAIL_WARM   = 500;   // ignored (first-touch effects)
     static constexpr long long BAIL_SAMPLE = 2750;  // baseline window end
 };
@@ -301,7 +322,8 @@ static bool moe_cache_ok(int di, cudaError_t e, const char * what) {
     if (e == cudaSuccess) return true;
     cudaGetLastError();
     if (di >= 0 && di < MOE_CACHE_MAX_DEV && !g.dev[di].dead) {
-        g.dev[di].dead = true;
+        g.dev[di].dead      = true;
+        g.dev[di].rearmable = false;   // broken, not merely tight
         MOE_CACHE_WARN("[moe-cache] dev=%d DISABLED: %s failed: %s (CPU path takes over)\n",
                 di, what, cudaGetErrorString(e));
     }
@@ -565,6 +587,8 @@ struct moe_cache_discovery {
     int  stable_count = 0;
 };
 static moe_cache_discovery g_disc;
+static bool   moe_cache_try_rearm(moe_cache_device & d, int di);
+static size_t moe_cache_trim_impl(int device, bool from_pressure);
 
 // build one pool for (size, wtype) on device di; caller ensures no duplicate
 static bool moe_cache_pool_alloc(int di, size_t expert_size, int wtype, size_t budget, bool paired,
@@ -709,7 +733,7 @@ static int moe_cache_begin(const char * name, const void * host_base, size_t exp
 
     const uint64_t kb = moe_cache_fnv1a(name);
     moe_cache_device & d = g.dev[di];
-    if (d.dead) return -1;
+    if (d.dead && !moe_cache_try_rearm(d, di)) return -1;
     const bool first_sight = g_disc.seen.count(kb) == 0;
 
     // shape discovery + on-demand pool construction (see moe_cache_discovery)
@@ -785,7 +809,7 @@ static int moe_cache_begin(const char * name, const void * host_base, size_t exp
         // unallocated and starved the down pool (measured).
         auto & pend = g_disc.pending[di];
         if (!pend.empty()) {
-            const size_t reserve = g.reserve_mb << 20;
+            const size_t reserve = (g.reserve_mb + (size_t) d.rearm_count * moe_cache_global::REARM_STEP_MB) << 20;
             size_t free_mem = 0, total_mem = 0;
             ggml_cuda_set_device(di);
             CUDA_CHECK(cudaMemGetInfo(&free_mem, &total_mem));
@@ -830,7 +854,13 @@ static int moe_cache_begin(const char * name, const void * host_base, size_t exp
                 size_t budget = (size_t)(group_left[gidx] * (shape_w(sh) / group_w_left[gidx]));
                 const int64_t max_entries = (paired ? sh.n_tensors / 2 : sh.n_tensors) * (int64_t)sh.n_expert;
                 const size_t need = (size_t)max_entries * sh.size * (paired ? 2 : 1);
-                if (budget > need) budget = need;          // never strand bytes in caps
+                // max_entries is 0 when the shape's tensor count is unknown, which is
+                // the case after a re-arm: n_tensors only counts first-sight tensors
+                // and nothing is first-sight the second time round. Capping to a
+                // "need" of 0 would zero the budget and permanently dead-mark the
+                // pool, so cap only when the count is real (mirrors the guard in
+                // moe_cache_pool_alloc).
+                if (max_entries > 0 && budget > need) budget = need;   // never strand bytes in caps
                 const size_t before = budget;
                 if (moe_cache_pool_alloc(di, sh.size, sh.wtype, budget, paired, max_entries)) {
                     group_left[gidx] -= before;            // consumed (approx; slack folds forward)
@@ -885,6 +915,14 @@ static int moe_cache_begin(const char * name, const void * host_base, size_t exp
     if (pp_phase) {
         // prompt processing: pools may now exist and the backfill workers warm
         // them in parallel with the prompt; the decode path stays untouched
+        return -1;
+    }
+
+    // test hook: exercise the trim/re-arm cycle without real VRAM pressure
+    if (g.force_trim > 0 && ++g.force_trim_seen == g.force_trim) {
+        MOE_CACHE_WARN("[moe-cache] dev=%d FORCE_TRIM after %lld eligible visits (test hook)\n",
+                di, g.force_trim_seen);
+        moe_cache_trim_impl(di, /*from_pressure =*/ true);
         return -1;
     }
 
@@ -1484,7 +1522,7 @@ static unsigned long long moe_cache_glu_hits(const void * src0_data, const void 
 // scratch buffer on the device and marks its cache dead (conservative: the
 // budget decision was clearly wrong for this workload). Returns bytes freed.
 
-extern "C" size_t ggml_moe_cache_trim(int device) {
+static size_t moe_cache_trim_impl(int device, bool from_pressure) {
     if (!g.enabled || device < 0 || device >= g.n_dev) return 0;
     moe_cache_device & d = g.dev[device];
     if (d.n_pools == 0 && !d.d_out) return 0;
@@ -1518,9 +1556,54 @@ extern "C" size_t ggml_moe_cache_trim(int device) {
     memset(g.resident_pair, 0, sizeof(g.resident_pair));
     memset(g.resident_down, 0, sizeof(g.resident_down));
     d.dead = true;
-    MOE_CACHE_WARN("[moe-cache] dev=%d TRIMMED %zu MB under VRAM pressure — cache off on this device\n",
-            device, freed >> 20);
+    if (from_pressure) {
+        d.rearm_count++;
+        d.rearmable    = d.rearm_count <= moe_cache_global::REARM_MAX;
+        d.trim_time_us = ggml_time_us();
+        d.dead_visits  = 0;
+    }
+    if (from_pressure && d.rearmable) {
+        MOE_CACHE_WARN("[moe-cache] dev=%d TRIMMED %zu MB under VRAM pressure — will re-arm with +%d MB reserve (attempt %d/%d)\n",
+                device, freed >> 20, d.rearm_count * moe_cache_global::REARM_STEP_MB,
+                d.rearm_count, moe_cache_global::REARM_MAX);
+    } else if (from_pressure) {
+        MOE_CACHE_WARN("[moe-cache] dev=%d TRIMMED %zu MB under VRAM pressure — %d trims reached, cache off on this device for the run\n",
+                device, freed >> 20, moe_cache_global::REARM_MAX);
+    } else {
+        MOE_CACHE_WARN("[moe-cache] dev=%d TRIMMED %zu MB under VRAM pressure — cache off on this device\n",
+                device, freed >> 20);
+    }
     return freed;
+}
+
+extern "C" size_t ggml_moe_cache_trim(int device) {
+    // the CUDA pool allocator's last-resort OOM handler: transient pressure, so
+    // this death is re-armable (see moe_cache_device::rearmable)
+    return moe_cache_trim_impl(device, /*from_pressure =*/ true);
+}
+
+// Reset one device to its pre-discovery state so the normal discovery path
+// rebuilds its pools, now at reserve + rearm_count*REARM_STEP_MB. Gated on a
+// visit counter and a cooldown so a device under sustained pressure does not
+// oscillate. Returns true when the caller may continue into discovery.
+static bool moe_cache_try_rearm(moe_cache_device & d, int di) {
+    if (!d.rearmable) return false;
+    if (++d.dead_visits % moe_cache_global::REARM_GATE_VISITS != 0) return false;
+    if (ggml_time_us() - d.trim_time_us < moe_cache_global::REARM_COOLDOWN_US) return false;
+
+    {
+        std::lock_guard<std::mutex> lk(g.mu);
+        for (int i = 0; i < d.n_pools; i++) d.pools[i] = moe_cache_pool{};
+        d.n_pools = 0;
+        d.dead    = false;
+        g_disc.pending[di].clear();
+        g_disc.stable_count = 0;   // costs the rebuilt device 64 visits; a healthy
+                                   // device never re-enters the discovery block
+    }
+    MOE_CACHE_WARN("[moe-cache] dev=%d re-arming after trim %d/%d (reserve +%d MB)\n",
+            di, d.rearm_count, moe_cache_global::REARM_MAX,
+            d.rearm_count * moe_cache_global::REARM_STEP_MB);
+    return true;
 }
 
 // ---- API: invalidate (host weight buffer teardown) -------------------------------------
@@ -1586,7 +1669,7 @@ static void moe_cache_node_time(int code, int64_t us) {
                     "disabling the cache and freeing its VRAM for this run\n",
                     b.on_ewma, b.base_ewma);
             for (int di = 0; di < g.n_dev; di++) {
-                ggml_moe_cache_trim(di);
+                moe_cache_trim_impl(di, /*from_pressure =*/ false);
             }
             g.enabled = false;
         }
@@ -1798,6 +1881,7 @@ void ggml_moe_cache_register(void) {
     if (const char * e = getenv("GGML_CUDA_MOE_CACHE_THROTTLE"))  { g.throttle_mod = atoi(e); if (g.throttle_mod < 1) g.throttle_mod = 1; }
     if (const char * e = getenv("GGML_CUDA_MOE_CACHE_WORKERS"))   { int n = atoi(e); if (n > 0 && n <= 16) g.n_workers = n; }
     if (const char * e = getenv("GGML_CUDA_MOE_CACHE_STATS"))     g.stats_every = atoi(e);
+    if (const char * e = getenv("GGML_CUDA_MOE_CACHE_FORCE_TRIM")) g.force_trim = atoll(e);
     if (const char * e = getenv("GGML_CUDA_MOE_CACHE_MIN_EXPERT_KB")) g.min_expert_bytes = (size_t)atoll(e) << 10;
     if (const char * e = getenv("GGML_CUDA_MOE_CACHE_RESERVE_MB"))    g.reserve_mb = (size_t)atoll(e);
     if (const char * e = getenv("GGML_CUDA_MOE_CACHE_REUSE"))         g.reuse = atoi(e) > 0;
