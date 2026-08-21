@@ -293,13 +293,22 @@ struct moe_cache_global {
         // keeps the judge comparing like with like (without this, -np 2 tripped
         // the bail-out and disabled the cache mid-run).
         int       cur_batch = 1;
+        // GGML_CUDA_MOE_CACHE_BAIL=0 turns the judge off entirely. Escape hatch:
+        // a mis-firing judge otherwise costs a rebuild to silence.
+        bool      judge_on  = true;
     } bail;
     static constexpr int  REARM_MAX        = 6;    // trims before giving up for the run
     static constexpr int  REARM_STEP_MB    = 256;  // reserve added per trim (6 x 256 = 1.5 GB)
     static constexpr int64_t REARM_COOLDOWN_US = 60ll * 1000 * 1000;  // settle before retrying
     static constexpr long long REARM_GATE_VISITS = 2048;  // cheap gate off the hot path
     static constexpr long long BAIL_WARM   = 500;   // ignored (first-touch effects)
-    static constexpr long long BAIL_SAMPLE = 2750;  // baseline window end
+    static constexpr long long BAIL_SAMPLE = 2750;  // first baseline window end
+    // The baseline must keep tracking the machine, not stay frozen at t=0: host
+    // RAM contention, KV growth and concurrent slots all move the pure-CPU cost
+    // over a long run, and a frozen baseline books that drift against the cache.
+    // Re-enter a short pure-CPU window periodically so base_ewma ages with it.
+    static constexpr long long BAIL_REBASE_EVERY  = 200000;  // visits between windows
+    static constexpr long long BAIL_REBASE_WINDOW = 2000;    // pure-CPU samples per window
 };
 
 // intentionally leaked: detached worker threads reference this state through
@@ -928,10 +937,15 @@ static int moe_cache_begin(const char * name, const void * host_base, size_t exp
 
     // bail-out phases (decode visits on a working pool only)
     g.bail.cur_batch = (int) n_tokens;   // set before the early returns below
-    if (!g.bail.tripped) {
+    if (g.bail.judge_on && !g.bail.tripped) {
         const long long vis = g.bail.eligible_seen++;
         if (vis < moe_cache_global::BAIL_WARM) return -1;        // warmup: no sample
         if (vis < moe_cache_global::BAIL_SAMPLE) return -3;      // pure CPU + timing sample
+        // periodic re-baseline: a short pure-CPU window every BAIL_REBASE_EVERY
+        // visits keeps base_ewma tracking the machine instead of t=0
+        const long long ph = (vis - moe_cache_global::BAIL_SAMPLE)
+                           % moe_cache_global::BAIL_REBASE_EVERY;
+        if (ph < moe_cache_global::BAIL_REBASE_WINDOW) return -3;
     }
 
     // paired pools share ONE entry per (blk, expert): key by blk + the GATE
@@ -1648,7 +1662,7 @@ static void moe_cache_invalidate(const void * base, size_t size) {
 // ---- API: node wall-time samples (bail-out) ---------------------------------------------
 
 static void moe_cache_node_time(int code, int64_t us) {
-    if (g.bail.tripped) return;
+    if (!g.bail.judge_on || g.bail.tripped) return;
     auto & b = g.bail;
     // only single-token decode nodes are comparable against the baseline
     if (b.cur_batch != 1) return;
@@ -1664,14 +1678,21 @@ static void moe_cache_node_time(int code, int64_t us) {
     if (b.on_n % 256 != 0) return;
     if (b.on_ewma > b.base_ewma * 1.05) {
         if (++b.strikes >= 4) {
-            b.tripped = true;
             MOE_CACHE_WARN("[moe-cache] bail-out: cache-engaged nodes average %.0fus vs %.0fus pure-CPU — "
-                    "disabling the cache and freeing its VRAM for this run\n",
+                    "freeing its VRAM; will rebuild and re-measure from a fresh baseline\n",
                     b.on_ewma, b.base_ewma);
+            // Re-armable, unlike the old verdict: a bail is a measurement taken
+            // under one set of machine conditions, not a permanent property of
+            // the workload. Free the VRAM, let the normal re-arm path rebuild
+            // the pools, and judge the rebuilt cache on its own fresh samples
+            // instead of inheriting this one. REARM_MAX still caps the cycles.
             for (int di = 0; di < g.n_dev; di++) {
-                moe_cache_trim_impl(di, /*from_pressure =*/ false);
+                moe_cache_trim_impl(di, /*from_pressure =*/ true);
             }
-            g.enabled = false;
+            b.eligible_seen = 0;
+            b.base_ewma = b.on_ewma = 0.0;
+            b.base_n = b.on_n = 0;
+            b.strikes = 0;
         }
     } else {
         b.strikes = 0;
@@ -1913,6 +1934,7 @@ void ggml_moe_cache_register(void) {
     ggml_moe_cache.invalidate        = moe_cache_invalidate;
     ggml_moe_cache.node_time         = moe_cache_node_time;
     if (const char * e = getenv("GGML_CUDA_MOE_CACHE_REDIRECT")) g.redirect_on = atoi(e) > 0;
+    if (const char * e = getenv("GGML_CUDA_MOE_CACHE_BAIL"))     g.bail.judge_on = atoi(e) > 0;
 
     MOE_CACHE_LOG("[moe-cache] enabled: n_dev=%d budget=%s inserts/plan=%d workers=%d stats_every=%d\n",
             g.n_dev, g.budget_mb ? "env" : "auto-70%-free", g.inserts_per_plan,
