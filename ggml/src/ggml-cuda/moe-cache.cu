@@ -1702,8 +1702,10 @@ static int moe_cache_stats_summary(char * buf, size_t buf_size) {
             ? (double)(d.t_plan_us + d.t_disp_us + d.t_coll_us) / d.n_nodes : 0.0;
         if (off >= buf_size) break;
         const int n = snprintf(buf + off, buf_size - off,
-                "moe-cache: dev=%d hits = %lld/%lld (%.1f%%), slots = %d/%d (%zu MiB), %.1f us/node\n",
-                i, d.hits, tot, 100.0 * d.hits / tot, used, slots, bytes >> 20, per_node);
+                "moe-cache: dev=%d hits = %lld/%lld (%.1f%%), slots = %d/%d (%zu MiB), "
+                "evict = %lld (miss: cap %lld / cold %lld), %.1f us/node\n",
+                i, d.hits, tot, 100.0 * d.hits / tot, used, slots, bytes >> 20,
+                d.evictions, d.miss_capacity, d.miss_compulsory, per_node);
         if (n < 0 || (size_t)n >= buf_size - off) { buf[off] = 0; break; }
         off += n;
     }
